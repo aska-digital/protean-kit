@@ -19,7 +19,8 @@
     "protean-github-flow",
     "protean-sym2p",
     "protean-control-plane",
-    "protean-handoff"
+    "protean-handoff",
+    "protean-context"
   ],
   "ingredients": [
     {
@@ -337,6 +338,37 @@
           "cwd": ".",
           "postInstall": false,
           "cmd": "python3 tests/test_handoff.py"
+        }
+      ],
+      "open": []
+    },
+    {
+      "slug": "protean-context",
+      "repo": "https://github.com/aska-digital/protean-context",
+      "ref": "refs/tags/v0.1.0",
+      "sha": "999d8fdee42408d8f78da0417f76ef91a66af4f9",
+      "version": "0.1.0",
+      "contract": "Versioned empty scaffolds and a stdlib-only bootstrap CLI that initialize a user-owned Eldunarya knowledge tree and Arif knowledge base with no bundled data.",
+      "kind": "skills",
+      "installTargets": [
+        "skills/protean-context",
+        "scripts/protean-context",
+        "templates/protean-context",
+        "gates/protean-context"
+      ],
+      "requires": [],
+      "recommends": [],
+      "integrity": {
+        "fileCount": 58,
+        "treeSha256": "a1da1bebd9b6f1529caa1e772d1a9ccdf5ada627102a01f8527efa53a37f74fe",
+        "algorithm": "protean-tree-v1"
+      },
+      "gates": [
+        {
+          "name": "post-install-sanity",
+          "cwd": ".",
+          "postInstall": true,
+          "cmd": "python3 gates/protean-context/check-post-install.py ."
         }
       ],
       "open": []
