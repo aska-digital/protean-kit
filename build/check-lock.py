@@ -113,13 +113,13 @@ def descriptor_of(pin, cache, ingredients_dir):
 def remote_tag_sha(repo, ref):
     """Resolve a tag ref against the remote. Returns the peeled commit sha,
     or None when the ref cannot be resolved."""
-    result = run(["git", "ls-remote", repo, ref])
+    result = run(["git", "ls-remote", repo, ref, ref + "^{}"])
     if result.returncode != 0:
         return None
     tag_sha = None
     for line in result.stdout.splitlines():
         sha, _, name = line.partition("\t")
-        if name == ref + "^{":
+        if name == ref + "^{}":
             return sha
         if name == ref:
             tag_sha = sha
