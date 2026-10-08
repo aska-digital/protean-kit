@@ -21,8 +21,11 @@ Modes:
                        plus parity against ingredient trees that are already
                        present in the cache or an ingredients directory.
   --verify             requires every pin's tree to be present (fetching it from
-                       the pinned tag when needed) and recomputes the sha pairing
-                       and treeSha256 for each one; a mismatch is exit 4.
+                       the pinned tag when needed), re-resolves every tag against
+                       the remote, and recomputes the sha pairing and treeSha256
+                       for each one. Each pin's verification provenance (remote
+                       tag pairing or local tree only) is reported; a moved tag
+                       or a hash mismatch is a violation.
 
 Usage:
   check-lock.py [LOCK] [--cache DIR] [--ingredients-dir DIR] [--verify] [--offline]
@@ -105,6 +108,22 @@ def descriptor_of(pin, cache, ingredients_dir):
             with open(path, encoding="utf-8") as fh:
                 return json.load(fh), cand
     return None, None
+
+
+def remote_tag_sha(repo, ref):
+    """Resolve a tag ref against the remote. Returns the peeled commit sha,
+    or None when the ref cannot be resolved."""
+    result = run(["git", "ls-remote", repo, ref, ref + "^{}"])
+    if result.returncode != 0:
+        return None
+    tag_sha = None
+    for line in result.stdout.splitlines():
+        sha, _, name = line.partition("\t")
+        if name == ref + "^{}":
+            return sha
+        if name == ref:
+            tag_sha = sha
+    return tag_sha
 
 
 def main():
@@ -216,6 +235,7 @@ def main():
         base = xdg if xdg else os.path.join(os.path.expanduser("~"), ".cache")
         cache = os.path.join(base, "protean-kit")
 
+    provenance = {}
     for slug in sorted(seen):
         pin = seen[slug]
         tree = None
@@ -223,8 +243,10 @@ def main():
             candidate = os.path.join(args.ingredients_dir, slug)
             if os.path.isdir(os.path.join(candidate, ".git")):
                 tree = candidate
+                provenance[slug] = "ingredients-dir"
         if tree is None and os.path.isdir(os.path.join(cache, slug, pin["sha"], ".git")):
             tree = os.path.join(cache, slug, pin["sha"])
+            provenance[slug] = "cache"
         if tree is None:
             if args.verify:
                 if args.offline:
@@ -243,11 +265,24 @@ def main():
                     continue
                 run(["git", "checkout", "--quiet", "--detach", pin["sha"]], cwd=work)
                 tree = work
-                unchecked.append(slug)
+                provenance[slug] = "remote"
             else:
                 unchecked.append(slug)
         if tree is None:
             continue
+        if args.verify and not args.offline and provenance.get(slug) != "remote":
+            # A warm cache or an ingredients-dir checkout can sit at the pinned
+            # sha while the published tag has moved on. --verify must never
+            # present a local cache entry as a published-release verification,
+            # so the tag pairing is re-resolved against the remote.
+            remote = remote_tag_sha(pin["repo"], pin["ref"])
+            if remote is None:
+                violations.append("%s: cannot resolve %s against the remote" % (slug, pin["ref"]))
+            elif remote != pin["sha"]:
+                violations.append("%s: %s resolves on the remote to %s, not the pinned %s"
+                                  % (slug, pin["ref"], remote, pin["sha"]))
+            else:
+                provenance[slug] = "remote"
         head = run(["git", "rev-parse", "HEAD"], cwd=tree)
         if head.returncode == 0 and head.stdout.strip() not in (pin["sha"], ""):
             violations.append("%s: tree is at %s, not the pinned %s"
@@ -272,6 +307,12 @@ def main():
         print("note: " + note)
     if unchecked:
         print("unverified (no tree available; run --verify): %s" % ", ".join(sorted(set(unchecked))))
+    if args.verify:
+        for slug in sorted(seen):
+            print("verify: %s [provenance: %s]" % (slug, provenance.get(slug, "no tree")))
+        if args.offline:
+            print("note: --verify --offline checked pins against local trees only; "
+                  "the remote tag pairing was not re-resolved")
     if violations:
         print("LOCK VIOLATION: %d" % len(violations))
         for v in violations:
