@@ -466,6 +466,48 @@ def fetch_entry(entry, cache, offline):
         raise
 
 
+def verify_cache_checkout(entry, entry_dir):
+    """Compare the files we execute/copy with the pinned blobs, not the index.
+
+    A matching HEAD and object tree do not authenticate a mutable checkout.
+    Read the worktree directly so skip-worktree/assume-unchanged and ignored
+    files cannot hide an altered or extra payload from the installer.
+    """
+    tracked = set()
+    tree = git(["ls-tree", "-r", "-z", "--full-tree", entry["sha"]], cwd=entry_dir)
+    for item in tree.split("\0"):
+        if not item:
+            continue
+        metadata, rel = item.split("\t", 1)
+        mode, kind, blob = metadata.split()
+        tracked.add(rel)
+        path = os.path.join(entry_dir, rel)
+        if kind != "blob" or not os.path.lexists(path):
+            raise Failure(4, "%s: cache file missing or unsupported: %s" % (entry["slug"], rel))
+        # The installer copies regular bytes, not links. A pinned link pins
+        # only its text; dereferencing it would copy bytes outside this tree.
+        if mode == "120000":
+            raise Failure(4, "%s: cache contains an unsupported symlink: %s" % (entry["slug"], rel))
+        if os.path.islink(path) or not os.path.isfile(path):
+            raise Failure(4, "%s: cache file type changed: %s" % (entry["slug"], rel))
+        with open(path, "rb") as handle:
+            data = handle.read()
+        executable = bool(os.stat(path).st_mode & 0o111)
+        if executable != (mode == "100755"):
+            raise Failure(4, "%s: cache file mode changed: %s" % (entry["slug"], rel))
+        actual = hashlib.sha1(b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest()
+        if actual != blob:
+            raise Failure(4, "%s: cache file differs from pinned blob: %s" % (entry["slug"], rel))
+    for root, directories, files in os.walk(entry_dir, followlinks=False):
+        if root == entry_dir:
+            directories[:] = [name for name in directories if name != ".git"]
+        links = [name for name in directories if os.path.islink(os.path.join(root, name))]
+        for name in files + links:
+            rel = os.path.relpath(os.path.join(root, name), entry_dir)
+            if rel not in tracked:
+                raise Failure(4, "%s: cache contains an unpinned file: %s" % (entry["slug"], rel))
+
+
 def verify_entry(entry, entry_dir):
     slug = entry["slug"]
     head = run(["git", "rev-parse", "HEAD"], cwd=entry_dir)
@@ -476,6 +518,7 @@ def verify_entry(entry, entry_dir):
     if actual != expected:
         raise Failure(4, "%s: treeSha256 mismatch\nexpected: %s\nactual:   %s"
                       % (slug, expected, actual))
+    verify_cache_checkout(entry, entry_dir)
     return True
 
 

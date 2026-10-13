@@ -231,6 +231,58 @@ class TestEndToEndInstall(FixtureCase):
         self.assertTrue(os.path.isfile(os.path.join(target, "payload", "protean-one", "file.txt")))
         self.assertFalse(os.path.isdir(os.path.join(target, ".protean-staging")))
 
+    def test_tampered_cache_is_refused_before_any_target_write(self):
+        for mutation in ("tracked", "untracked", "ignored", "hidden-tracked"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as base:
+                os.makedirs(os.path.join(base, "repos"))
+                cache = os.path.join(base, "cache")
+                fixture = build_ingredient(os.path.join(base, "repos"), "protean-one")
+                cached = warm_cache(cache, "protean-one", fixture)
+                lock = write_lock(os.path.join(base, "kit.lock.json"),
+                                  [lock_entry("protean-one", fixture)])
+                payload = os.path.join(cached, "payload", "protean-one", "file.txt")
+                if mutation == "hidden-tracked":
+                    git(["update-index", "--skip-worktree", "payload/protean-one/file.txt"], cwd=cached)
+                if mutation in ("tracked", "hidden-tracked"):
+                    with open(payload, "w", encoding="utf-8") as handle:
+                        handle.write("TAMPERED CACHE PAYLOAD\n")
+                else:
+                    name = "injected.txt" if mutation == "untracked" else "injected.pyc"
+                    if mutation == "ignored":
+                        with open(os.path.join(cached, ".git", "info", "exclude"), "a") as handle:
+                            handle.write("*.pyc\n")
+                    with open(os.path.join(os.path.dirname(payload), name), "w") as handle:
+                        handle.write("UNPINNED CACHE PAYLOAD\n")
+                target = os.path.join(base, "installed")
+                result = run(INSTALL, "--all", "--target", target, "--offline", "--cache", cache,
+                             "--lock", lock)
+                self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+                self.assertIn("cache", result.stderr)
+                self.assertFalse(os.path.exists(target), "integrity failure must precede writes")
+
+    def test_pinned_symlink_cannot_copy_unpinned_external_bytes(self):
+        fixture = self.ingredient("protean-one")
+        outside = os.path.join(self.base, "outside-marker.txt")
+        with open(outside, "w") as handle:
+            handle.write("UNPINNED EXTERNAL MARKER\n")
+        os.symlink(outside, os.path.join(fixture["path"], "payload", "protean-one", "linked.txt"))
+        git(["add", "payload/protean-one/linked.txt"], cwd=fixture["path"])
+        git(IDENTITY + ["commit", "--quiet", "-m", "synthetic symlink"], cwd=fixture["path"])
+        fixture["sha"] = git(["rev-parse", "HEAD"], cwd=fixture["path"])
+        git(IDENTITY + ["tag", "-a", "v1.0.1", "-m", "synthetic symlink fixture"], cwd=fixture["path"])
+        warm_cache(self.cache, "protean-one", fixture)
+        entry = lock_entry("protean-one", fixture)
+        entry.update(ref="refs/tags/v1.0.1", version="1.0.1")
+        lock = write_lock(os.path.join(self.base, "kit.lock.json"), [entry])
+        target = os.path.join(self.base, "installed")
+        result = run(INSTALL, "--all", "--target", target, "--offline", "--cache", self.cache,
+                     "--lock", lock)
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertIn("symlink", result.stderr)
+        self.assertFalse(os.path.exists(target))
+        with open(outside) as handle:
+            self.assertEqual(handle.read(), "UNPINNED EXTERNAL MARKER\n")
+
     def test_single_ingredient_dry_run_writes_nothing(self):
         fixture, lock = self.fixture_lock()
         target = os.path.join(self.base, "dry-target")
