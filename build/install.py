@@ -491,14 +491,73 @@ def read_descriptor(entry_dir):
         return json.load(fh)
 
 
-def copy_paths(entry_dir, staging, targets):
+def confined_path(target, path):
+    """Check both spelling and physical destination against the resolved root.
+
+    Rechecked at mutation boundaries; this is not descriptor-based IO and does
+    not defend against a concurrent actor replacing links between check and use.
+    """
+    path = os.path.abspath(path)
+    try:
+        inside = (os.path.commonpath([target, path]) == target
+                  and os.path.commonpath([target, os.path.realpath(path)]) == target)
+    except (ValueError, OSError):
+        inside = False
+    if not inside:
+        raise Failure(5, "target path escapes the resolved target root: %s" % path)
+    return path
+
+
+def confined_tree(target, path):
+    """Check existing descendants too, before recursively deleting a tree."""
+    confined_path(target, path)
+    if os.path.isdir(path):
+        for root, dirs, files in os.walk(path, followlinks=False):
+            for name in dirs + files:
+                confined_path(target, os.path.join(root, name))
+
+
+def selected_paths(entry, entry_dir):
+    """Expand every selected payload before the first target mutation."""
+    paths = set(entry["installTargets"])
+    for rel in entry["installTargets"]:
+        src = os.path.join(entry_dir, rel)
+        if os.path.isdir(src):
+            for root, dirs, files in os.walk(src, followlinks=True):
+                for name in dirs + files:
+                    paths.add(os.path.relpath(os.path.join(root, name), entry_dir))
+        elif not os.path.isfile(src):
+            raise Failure(5, "declared install target missing in the ingredient: %s" % rel)
+    return paths
+
+
+def preflight_target(target, order, entries, sources):
+    confined_tree(target, os.path.join(target, STAGING))
+    for slug in order:
+        staging = os.path.join(target, STAGING, slug)
+        confined_path(target, staging)
+        for rel in selected_paths(entries[slug], sources[slug]):
+            confined_path(target, os.path.join(target, rel))
+            confined_path(target, os.path.join(staging, rel))
+        descriptor = read_descriptor(sources[slug])
+        for gate in descriptor.get("gates") or []:
+            confined_path(target, os.path.join(staging, gate.get("cwd", ".")))
+    confined_path(target, os.path.join(target, STATE_REL))
+    confined_path(target, os.path.join(target, STATE_TMPL_REL))
+
+
+def copy_paths(entry_dir, staging, targets, target):
     written = []
     for rel in targets:
         src = os.path.join(entry_dir, rel)
-        dest = os.path.join(staging, rel)
+        dest = confined_path(target, os.path.join(staging, rel))
         if os.path.isdir(src):
             if os.path.isdir(dest):
-                shutil.rmtree(dest)
+                confined_tree(target, dest)
+                if os.path.islink(dest):
+                    os.unlink(dest)
+                else:
+                    shutil.rmtree(dest)
             shutil.copytree(src, dest)
             for root, _dirs, files in os.walk(dest):
                 for name in files:
@@ -512,7 +571,7 @@ def copy_paths(entry_dir, staging, targets):
     return sorted(written)
 
 
-def run_gates(descriptor, entry_dir, staging):
+def run_gates(descriptor, entry_dir, staging, target):
     gates = descriptor.get("gates") or []
     ran = []
     for gate in gates:
@@ -521,7 +580,7 @@ def run_gates(descriptor, entry_dir, staging):
         cmd = gate.get("cmd")
         if not cmd:
             continue
-        cwd = os.path.join(staging, gate.get("cwd", "."))
+        cwd = confined_path(target, os.path.join(staging, gate.get("cwd", ".")))
         result = run(["bash", "-c", cmd], cwd=cwd)
         ran.append({"name": gate.get("name"), "cmd": cmd, "exit": result.returncode})
         if result.returncode != 0:
@@ -532,8 +591,8 @@ def run_gates(descriptor, entry_dir, staging):
 
 def promote(staging, target, written):
     for rel in written:
-        src = os.path.join(staging, rel)
-        dest = os.path.join(target, rel)
+        src = confined_path(target, os.path.join(staging, rel))
+        dest = confined_path(target, os.path.join(target, rel))
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         if os.path.exists(dest):
             os.remove(dest)
@@ -560,18 +619,27 @@ def read_back(entry_dir, target, written):
 def install_one(entry, cache, opts, plan, entry_dir):
     slug = entry["slug"]
     target = plan["target"]
+    preflight_target(target, [slug], {slug: entry}, {slug: entry_dir})
     os.makedirs(target, exist_ok=True)
     if not os.access(target, os.W_OK):
         raise Failure(5, "target is not writable: %s" % target)
     descriptor = read_descriptor(entry_dir)
     staging_root = os.path.join(target, STAGING, slug)
     if os.path.isdir(staging_root):
-        shutil.rmtree(staging_root)
+        confined_tree(target, staging_root)
+        if os.path.islink(staging_root):
+            os.unlink(staging_root)
+        else:
+            shutil.rmtree(staging_root)
     os.makedirs(staging_root, exist_ok=True)
-    written = copy_paths(entry_dir, staging_root, entry["installTargets"])
-    gates = run_gates(descriptor, entry_dir, staging_root)
+    written = copy_paths(entry_dir, staging_root, entry["installTargets"], target)
+    gates = run_gates(descriptor, entry_dir, staging_root, target)
     promote(staging_root, target, written)
-    shutil.rmtree(os.path.join(target, STAGING), ignore_errors=True)
+    confined_tree(target, os.path.join(target, STAGING))
+    if os.path.islink(os.path.join(target, STAGING)):
+        os.unlink(os.path.join(target, STAGING))
+    else:
+        shutil.rmtree(os.path.join(target, STAGING), ignore_errors=True)
     return written, gates
 
 
@@ -613,11 +681,11 @@ def contribution_state(target, mode, operator_ref):
     own installed template instead of carrying a copy of it. An existing record
     is left untouched: an install never silently widens a permission.
     """
-    dest = os.path.join(target, STATE_REL)
+    dest = confined_path(target, os.path.join(target, STATE_REL))
     if os.path.exists(dest):
         return None, ("%s already exists and was left unchanged; an install never overwrites "
                       "an existing contribution-state record" % STATE_REL)
-    template = os.path.join(target, STATE_TMPL_REL)
+    template = confined_path(target, os.path.join(target, STATE_TMPL_REL))
     if not os.path.isfile(template):
         if mode == "on":
             raise Failure(5, "contribution mode 'on' was requested, but %s is not installed, "
@@ -639,6 +707,7 @@ def contribution_state(target, mode, operator_ref):
         row = contribution_switch_row(now, mode, operator_ref)
         text = "\n".join(row if "empty state" in line.lower() else line
                          for line in text.splitlines()) + "\n"
+    confined_path(target, dest)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     with open(dest, "w", encoding="utf-8") as fh:
         fh.write(text)
@@ -695,7 +764,7 @@ def main(argv):
         warn(order_note)
 
     plan = {
-        "target": target_root(opts),
+        "target": os.path.realpath(target_root(opts)),
         "selection_label": "--all" if opts["all"] else ", ".join(selection),
         "no_deps": opts["no_deps"],
         "degraded": degraded,
@@ -711,12 +780,18 @@ def main(argv):
     info("order: %s" % " -> ".join(order))
     installed = []
     warnings = []
+    sources = {}
     for slug in order:
         entry = seen[slug]
         entry_dir, how = fetch_entry(entry, cache, opts["offline"])
         info("fetch: %s [%s]" % (slug, how))
         verify_entry(entry, entry_dir)
         info("verify: %s [sha ok, tree ok]" % slug)
+        sources[slug] = entry_dir
+    preflight_target(plan["target"], order, seen, sources)
+    for slug in order:
+        entry = seen[slug]
+        entry_dir = sources[slug]
         written, gates = install_one(entry, cache, opts, plan, entry_dir)
         info("install: %s [staged, %d gate(s) passed, %d file(s) promoted]"
              % (slug, len(gates), len(written)))

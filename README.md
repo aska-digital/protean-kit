@@ -76,6 +76,14 @@ bash install.sh --ingredient protean-drafts --target ./protean-installed
 
 The installer verifies each pinned tag and tree before promotion, then reads every written file back.
 
+The explicit target root may be a deliberate symlink; it is resolved once. All
+selected staging, promotion, cleanup, and contribution-state paths must stay
+beneath that physical root. Existing child links that escape it are refused
+with install exit 5 before any selected ingredient writes or staging cleanup.
+Links to destinations within the root remain supported. The installer preflights
+the full selection and rechecks mutation boundaries; these path checks do not
+protect against concurrent hostile link replacement between a check and use.
+
 ## What's in the repo
 
 | Folder | What it is |
