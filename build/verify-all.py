@@ -88,6 +88,9 @@ def main():
     gates.append(("contribution mode tests",
                   [sys.executable, "-m", "unittest", "tests.test_contribution_mode"]))
 
+    gates.append(("target confinement tests",
+                  [sys.executable, "-m", "unittest", "tests.test_target_confinement"]))
+
     # Run all gates
     results = []
     for name, cmd in gates:
